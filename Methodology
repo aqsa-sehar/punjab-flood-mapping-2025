@@ -1,0 +1,20 @@
+Methodological Workflow
+       [ Sentinel-1 SAR (VV) Data ]
+                   │
+         ┌─────────┴─────────┐
+         ▼                   ▼
+  Pre-Flood (Jul)     Post-Flood (Sep)
+         │                   │
+         └─────────┬─────────┘
+                   ▼
+         [ Speckle Filtering ]
+                   ▼
+     [ Water Masking (< -17 dB) ]
+                   ▼
+  [ Mask Permanent Water (JRC Dataset) ]
+                   ▼
+       [ Isolate Flood Extent ]
+                   │
+      ┌────────────┼────────────┐
+      ▼            ▼            ▼
+ [Map Layers]  [Statistics]  [Exports]
