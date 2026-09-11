@@ -1,0 +1,523 @@
+/*************************************************************
+ * FLOOD MONITORING - PUNJAB, PAKISTAN (2025)
+ * Sentinel-1 SAR Before/After Flood Comparison
+ * Includes: Analysis, District Stats, Charts, and Exports
+ *************************************************************/
+
+// ============================================================
+// SECTION 1: STUDY AREA
+// ============================================================
+// Load Punjab province boundary
+var punjab = ee.FeatureCollection("FAO/GAUL/2015/level1")
+  .filter(ee.Filter.eq('ADM1_NAME', 'Punjab'))
+  .filter(ee.Filter.eq('ADM0_NAME', 'Pakistan'));
+
+var geometry = punjab.geometry();
+Map.centerObject(geometry, 7);
+Map.addLayer(geometry, {color: 'grey'}, 'Punjab Boundary', false);
+
+// Load all districts within Punjab
+var districts = ee.FeatureCollection("FAO/GAUL/2015/level2")
+  .filter(ee.Filter.eq('ADM1_NAME', 'Punjab'))
+  .filter(ee.Filter.eq('ADM0_NAME', 'Pakistan'));
+
+
+// ============================================================
+// SECTION 2: DATE WINDOWS
+// ============================================================
+// Pre-flood date range (Normal water levels)
+var beforeStart = '2025-07-01';
+var beforeEnd   = '2025-07-15';
+
+// Post-flood date range (Peak flood period)
+var afterStart  = '2025-09-01';
+var afterEnd    = '2025-09-10';
+
+
+// ============================================================
+// SECTION 3: LOAD SENTINEL-1 SAR DATA
+// ============================================================
+// Filter radar satellite images for Punjab
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(geometry)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .select('VV');
+
+// Get average image for before and after periods
+var beforeCollection = s1.filterDate(beforeStart, beforeEnd);
+var afterCollection  = s1.filterDate(afterStart, afterEnd);
+
+var beforeImage = beforeCollection.median().clip(geometry);
+var afterImage  = afterCollection.median().clip(geometry);
+
+print('Before images found:', beforeCollection.size());
+print('After images found:', afterCollection.size());
+
+
+// ============================================================
+// SECTION 4: SPECKLE FILTERING
+// ============================================================
+// Smooth the imagery to reduce radar noise
+var smoothingRadius = 50; // meters
+
+var beforeFiltered = beforeImage.focal_median(smoothingRadius, 'circle', 'meters');
+var afterFiltered  = afterImage.focal_median(smoothingRadius, 'circle', 'meters');
+
+
+// ============================================================
+// SECTION 5: WATER DETECTION (THRESHOLDING)
+// ============================================================
+// Water shows low radar values (< -17 dB)
+var threshold = -17; 
+
+var beforeWater = beforeFiltered.lt(threshold).rename('water');
+var afterWater  = afterFiltered.lt(threshold).rename('water');
+
+
+// ============================================================
+// SECTION 6: MASK PERMANENT WATER
+// ============================================================
+// Remove permanent water bodies (rivers, lakes) using JRC dataset
+var jrc = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('seasonality');
+var permanentWater = jrc.gte(10).clip(geometry); // Present >10 months/year
+
+var beforeFloodOnly = beforeWater.updateMask(permanentWater.not());
+var afterFloodOnly  = afterWater.updateMask(permanentWater.not());
+
+
+// ============================================================
+// SECTION 7: FLOOD EXTENT
+// ============================================================
+// Find new water (present AFTER flood, but NOT BEFORE)
+var floodExtent = afterFloodOnly.and(beforeFloodOnly.not()).selfMask().rename('flood');
+
+
+// ============================================================
+// SECTION 8: MAP VISUALIZATION
+// ============================================================
+var sarVis = {min: -25, max: 0};
+
+Map.addLayer(beforeFiltered, sarVis, 'Before Flood (SAR VV)', false);
+Map.addLayer(afterFiltered, sarVis, 'After Flood (SAR VV)', false);
+Map.addLayer(beforeFloodOnly.selfMask(), {palette: ['blue']}, 'Water - Before Flood');
+Map.addLayer(afterFloodOnly.selfMask(), {palette: ['red']}, 'Water - After Flood');
+Map.addLayer(floodExtent, {palette: ['orange']}, 'Flood Extent (New Water)');
+Map.addLayer(permanentWater.selfMask(), {palette: ['darkblue']}, 'Permanent Water Bodies', false);
+
+// Combine into one map: 0=Land, 1=Permanent Water, 2=Flood
+var classified = ee.Image(0)
+  .where(permanentWater, 1)
+  .where(floodExtent.unmask(0), 2)
+  .rename('class')
+  .clip(geometry);
+
+Map.addLayer(classified, {min: 0, max: 2, palette: ['ffffff', '0000ff', 'ff0000']}, 'Classified Flood Map');
+
+
+// ============================================================
+// SECTION 9: AREA CALCULATIONS (PUNJAB-WIDE)
+// ============================================================
+var pixelArea = ee.Image.pixelArea();
+
+// Resolution set to 250m to avoid memory errors
+var evalScale = 250; 
+
+// Calculate areas in km²
+var beforeAreaVal = beforeFloodOnly.multiply(pixelArea).divide(1e6)
+  .reduceRegion({reducer: ee.Reducer.sum(), geometry: geometry, scale: evalScale, maxPixels: 1e13})
+  .get('water');
+
+var afterAreaVal = afterFloodOnly.multiply(pixelArea).divide(1e6)
+  .reduceRegion({reducer: ee.Reducer.sum(), geometry: geometry, scale: evalScale, maxPixels: 1e13})
+  .get('water');
+
+var newFloodVal = floodExtent.multiply(pixelArea).divide(1e6)
+  .reduceRegion({reducer: ee.Reducer.sum(), geometry: geometry, scale: evalScale, maxPixels: 1e13})
+  .get('flood');
+
+var permAreaVal = permanentWater.multiply(pixelArea).divide(1e6)
+  .reduceRegion({reducer: ee.Reducer.sum(), geometry: geometry, scale: evalScale, maxPixels: 1e13})
+  .get('seasonality');
+
+print('Water area BEFORE flood (km²):', beforeAreaVal);
+print('Water area AFTER flood (km²):', afterAreaVal);
+print('NEW flood-affected area (km²):', newFloodVal);
+print('Permanent water area (km²):', permAreaVal);
+
+
+// ============================================================
+// SECTION 10: DISTRICT-WISE ANALYSIS
+// ============================================================
+var floodAreaImg = floodExtent.multiply(pixelArea).divide(1e6); // Area in km²
+
+// Calculate flood area for each district
+var districtFloodStats = floodAreaImg.reduceRegions({
+  collection: districts,
+  reducer: ee.Reducer.sum().setOutputs(['flood_km2']),
+  scale: evalScale
+}).map(function(f) {
+  return f.set('district', f.get('ADM2_NAME'));
+});
+
+// Sort districts by flood area and select top 15
+var sortedDistricts = districtFloodStats
+  .filter(ee.Filter.gt('flood_km2', 0))
+  .sort('flood_km2', false);
+
+var top15Districts = sortedDistricts.limit(15);
+print('Top 15 Most Flooded Districts:', top15Districts);
+
+// Create severity map layer
+var districtRaster = top15Districts
+  .reduceToImage({
+    properties: ['flood_km2'],
+    reducer: ee.Reducer.first()
+  });
+
+var districtVis = {
+  min: 10,
+  max: 55,
+  palette: ['#ffffe5', '#fed976', '#feb24c', '#fd8d3c', '#e31a1c', '#800026']
+};
+
+Map.addLayer(districtRaster, districtVis, 'Top 15 Flooded Districts (Severity Gradient)');
+
+// Add district outline borders
+var districtOutlines = ee.Image().byte().paint({
+  featureCollection: top15Districts,
+  color: 1,
+  width: 1.5
+});
+Map.addLayer(districtOutlines, {palette: ['000000']}, 'Top 15 District Outlines');
+
+
+// ============================================================
+// SECTION 11: CHARTS
+// ============================================================
+
+// 11.1 Top 15 districts bar chart
+var topChart = ui.Chart.feature.byFeature({
+  features: sortedDistricts.limit(15),
+  xProperty: 'district',
+  yProperties: ['flood_km2']
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Top 15 Most Flooded Districts in Punjab (2025)',
+  hAxis: {title: 'District', slantedText: true, slantedTextAngle: 45},
+  vAxis: {title: 'Flood Area (km²)'},
+  legend: {position: 'none'},
+  colors: ['cc0000'],
+  bar: {groupWidth: '70%'}
+});
+print(topChart);
+
+// 11.2 Before vs After comparison bar chart
+var comparisonFC = ee.FeatureCollection([
+  ee.Feature(null, {label: 'Before Flood (Jul 2025)', area_km2: beforeAreaVal}),
+  ee.Feature(null, {label: 'After Flood (Sep 2025)', area_km2: afterAreaVal})
+]);
+
+var comparisonChart = ui.Chart.feature.byFeature({
+  features: comparisonFC,
+  xProperty: 'label',
+  yProperties: ['area_km2']
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Total Surface Water Area: Before vs After Flood',
+  vAxis: {title: 'Area (km²)'},
+  hAxis: {title: ''},
+  legend: {position: 'none'},
+  colors: ['1a73e8']
+});
+print(comparisonChart);
+
+// 11.3 Permanent vs Flood water pie chart
+var pieFC = ee.FeatureCollection([
+  ee.Feature(null, {type: 'Permanent Water', area: permAreaVal}),
+  ee.Feature(null, {type: 'New Flood Water', area: newFloodVal})
+]);
+
+var pieChart = ui.Chart.feature.byFeature(pieFC, 'type', 'area')
+  .setChartType('PieChart')
+  .setOptions({
+    title: 'Permanent Water vs New Flood-Induced Water',
+    colors: ['0000ff', 'ff4500'],
+    pieHole: 0.4
+  });
+print(pieChart);
+
+// 11.4 Radar signal distribution histograms
+var histBefore = ui.Chart.image.histogram({
+  image: beforeFiltered,
+  region: geometry,
+  scale: 250,
+  maxPixels: 1e13
+}).setOptions({
+  title: 'SAR Backscatter Histogram - BEFORE Flood (VV, dB)',
+  hAxis: {title: 'Backscatter (dB)'},
+  vAxis: {title: 'Pixel Count'},
+  colors: ['1a73e8']
+});
+print(histBefore);
+
+var histAfter = ui.Chart.image.histogram({
+  image: afterFiltered,
+  region: geometry,
+  scale: 250,
+  maxPixels: 1e13
+}).setOptions({
+  title: 'SAR Backscatter Histogram - AFTER Flood (VV, dB)',
+  hAxis: {title: 'Backscatter (dB)'},
+  vAxis: {title: 'Pixel Count'},
+  colors: ['cc0000']
+});
+print(histAfter);
+
+// 11.5 Flood extent line chart over time
+var timeSeriesCollection = s1.filterDate('2025-08-01', '2025-09-20');
+
+var waterAreaTimeSeries = timeSeriesCollection.map(function(img) {
+  var filtered = img.focal_median(50, 'circle', 'meters');
+  var water = filtered.lt(threshold).updateMask(permanentWater.not());
+  var areaKm2 = water.multiply(ee.Image.pixelArea()).divide(1e6)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: geometry,
+      scale: 500,
+      maxPixels: 1e13
+    }).get('VV');
+  return ee.Feature(null, {
+    date: img.date().format('YYYY-MM-dd'),
+    flood_area_km2: areaKm2
+  });
+});
+
+var tsChart = ui.Chart.feature.byFeature({
+  features: ee.FeatureCollection(waterAreaTimeSeries),
+  xProperty: 'date',
+  yProperties: ['flood_area_km2']
+})
+.setChartType('LineChart')
+.setOptions({
+  title: 'Flood Extent Progression Over Time (Aug-Sep 2025)',
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'Flood Area (km²)'},
+  lineWidth: 3,
+  pointSize: 5,
+  colors: ['d62728']
+});
+print(tsChart);
+
+
+// ============================================================
+// SECTION 12: EXPORTS (Check the Tasks tab)
+// ============================================================
+
+// Export processed radar images
+Export.image.toDrive({
+  image: beforeFiltered.toFloat(),
+  description: 'S1_VV_Before_Flood',
+  folder: 'GEE_exports',
+  region: geometry,
+  scale: 20,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: afterFiltered.toFloat(),
+  description: 'S1_VV_After_Flood',
+  folder: 'GEE_exports',
+  region: geometry,
+  scale: 20,
+  maxPixels: 1e13
+});
+
+// Export water and flood layer maps
+Export.image.toDrive({
+  image: beforeFloodOnly.unmask(0).toByte(),
+  description: 'Water_Before_Flood',
+  folder: 'GEE_exports',
+  region: geometry,
+  scale: 20,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: afterFloodOnly.unmask(0).toByte(),
+  description: 'Water_After_Flood',
+  folder: 'GEE_exports',
+  region: geometry,
+  scale: 20,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: floodExtent.unmask(0).toByte(),
+  description: 'Flood_Extent_2025',
+  folder: 'GEE_exports',
+  region: geometry,
+  scale: 20,
+  maxPixels: 1e13
+});
+
+// Export final colored flood map
+var classifiedVis = classified.visualize({
+  min: 0, max: 2,
+  palette: ['ffffff', '0000ff', 'ff0000']
+});
+
+Export.image.toDrive({
+  image: classifiedVis,
+  description: 'Flood_Classification_Map',
+  folder: 'GEE_exports',
+  region: geometry,
+  scale: 20,
+  maxPixels: 1e13
+});
+
+// Export district statistics to CSV
+Export.table.toDrive({
+  collection: districtFloodStats.select(['district', 'flood_km2']),
+  description: 'District_Flood_Area_Stats',
+  folder: 'GEE_exports',
+  fileFormat: 'CSV'
+});
+
+
+// ============================================================
+// SECTION 13: UI COMPONENTS (TITLE & LEGEND)
+// ============================================================
+
+// Add title panel at the top
+var titlePanel = ui.Panel({
+  style: {
+    position: 'top-center',
+    padding: '8px 16px',
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    border: '1px solid #7f8c8d'
+  }
+});
+
+var titleLabel = ui.Label({
+  value: 'PUNJAB FLOOD IMPACT ASSESSMENT (2025)',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    color: '#000000',
+    textAlign: 'center'
+  }
+});
+
+var subtitleLabel = ui.Label({
+  value: 'Sentinel-1 SAR Detection | Baseline: July 2025 vs Peak: September 2025',
+  style: {
+    fontSize: '11px',
+    margin: '0',
+    color: '#7f8c8d',
+    textAlign: 'center'
+  }
+});
+
+titlePanel.add(titleLabel);
+titlePanel.add(subtitleLabel);
+Map.add(titlePanel);
+
+// Add legend panel at bottom right
+var legendPanel = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '10px 12px',
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    border: '1px solid #bdc3c7',
+    width: '210px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'Classifications & Severity',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '14px',
+    margin: '0 0 8px 0',
+    color: '#2c3e50'
+  }
+});
+
+legendPanel.add(legendTitle);
+
+// Helper function to create legend rows
+function makeLegendRow(color, name) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 8px 0 0',
+      border: '1px solid #7f8c8d'
+    }
+  });
+
+  var description = ui.Label({
+    value: name,
+    style: {
+      fontSize: '12px',
+      margin: '0',
+      color: '#34495e'
+    }
+  });
+
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.Flow('horizontal'),
+    style: {margin: '0 0 4px 0'}
+  });
+}
+
+legendPanel.add(makeLegendRow('#ff7f00', 'New Flood Extent'));
+legendPanel.add(makeLegendRow('#e63946', 'Water Extent (After Flood)'));
+legendPanel.add(makeLegendRow('#0000ff', 'Water Extent (Before Flood)'));
+legendPanel.add(makeLegendRow('#00008b', 'Permanent Water Bodies'));
+
+// Add severity bar title
+var severityTitle = ui.Label({
+  value: 'District Severity (km² Flooded)',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '12px',
+    margin: '8px 0 4px 0',
+    color: '#2c3e50'
+  }
+});
+legendPanel.add(severityTitle);
+
+// Add gradient bar image
+var colorBar = ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: {
+    bbox: [0, 0, 1, 0.1],
+    dimensions: '180x10',
+    format: 'png',
+    min: 0,
+    max: 1,
+    palette: ['#ffffe5', '#fed976', '#feb24c', '#fd8d3c', '#e31a1c', '#800026']
+  },
+  style: {margin: '0 0 2px 0'}
+});
+legendPanel.add(colorBar);
+
+// Add min/max labels for severity bar
+var minLabel = ui.Label('10 km²', {fontSize: '10px', margin: '0', color: '#34495e'});
+var maxLabel = ui.Label('55+ km² (Jhang)', {fontSize: '10px', margin: '0 0 0 60px', fontWeight: 'bold', color: '#800026'});
+
+var legendLabels = ui.Panel({
+  widgets: [minLabel, maxLabel],
+  layout: ui.Panel.Layout.Flow('horizontal'),
+  style: {margin: '0'}
+});
+legendPanel.add(legendLabels);
+
+Map.add(legendPanel);
